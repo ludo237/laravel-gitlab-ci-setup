@@ -1,3 +1,9 @@
-# laravel-gitlab-ci-setup
+# Laravel Gitlab Ci Setup
 
-Complete setup for Laravel and Gitlab CI. 
+Complete setup for Laravel and Gitlab CI.
+
+## How it works
+
+## How to use
+
+## How to contribute
