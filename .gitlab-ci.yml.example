@@ -1,0 +1,120 @@
+image: 6gosrl/docker-php-gitlab-ci
+
+stages:
+- build
+- test
+- deploy
+
+variables:
+  MYSQL_DATABASE: gitlab_ci
+  MYSQL_USER: gitlab
+  MYSQL_PASSWORD: gitlabci
+  MYSQL_ROOT_PASSWORD: gitlabci
+
+build:
+  stage: build
+  environment:
+    name: building
+  except:
+  - issue
+  - pushes
+  script:
+  - bash scripts/ci/run-composer.sh
+  - bash scripts/ci/run-npm.sh
+  retry: 1
+  cache:
+    key: ${CI_BUILD_REF_NAME}
+    paths:
+    - vendor/
+    - node_modules/
+    - public/
+    - .composer-cache/
+    untracked: true
+  artifacts:
+    expire_in: 30 min
+    paths:
+    - vendor/
+    - node_modules/
+    - public/
+
+unit:
+  stage: test
+  environment:
+    name: testing
+  except:
+  - issue
+  - pushes
+  services:
+  - redis:alpine
+  - mariadb:10.3
+  script:
+  - bash scripts/ci/run-unit.sh
+  retry: 1
+  artifacts:
+    paths:
+    - ./storage/logs
+    expire_in: 1 day
+    when: always
+  cache:
+    key: ${CI_BUILD_REF_NAME}
+    policy: pull
+
+feature:
+  stage: test
+  environment:
+    name: testing
+  except:
+  - issue
+  - pushes
+  services:
+  - redis:alpine
+  - mariadb:10.3
+  script:
+  - bash scripts/ci/run-feature.sh
+  retry: 1
+  artifacts:
+    paths:
+    - ./storage/logs
+    expire_in: 1 day
+    when: always
+  cache:
+    key: ${CI_BUILD_REF_NAME}
+    policy: pull
+
+browser:
+  stage: test
+  environment:
+    name: testing
+  except:
+    - issue
+    - pushes
+  image: chilio/laravel-dusk-ci:stable
+  services:
+    - redis:alpine
+    - mariadb:10.3
+  script:
+    - bash scripts/ci/run-browser.sh
+  retry: 1
+  cache:
+    key: ${CI_BUILD_REF_NAME}
+    policy: pull
+  artifacts:
+    paths:
+      - ./storage/logs
+      - ./tests/Browser/screenshots
+      - ./tests/Browser/console
+    expire_in: 1 day
+    when: always
+
+deploy:
+  stage: deploy
+  environment:
+    name: production
+  image: php:7.2-cli
+  only:
+  - tags
+  script:
+  - bash scripts/ci/setup-deploy.sh
+  cache:
+    key: ${CI_BUILD_REF_NAME}
+    policy: pull
