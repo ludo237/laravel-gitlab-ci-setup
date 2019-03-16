@@ -1,120 +1,169 @@
+# Internal official image
 image: 6gosrl/docker-php-gitlab-ci
 
+# Setup common stages
 stages:
-- build
-- test
-- deploy
+  - build
+  - make
+  - test
+  - deploy
 
+# We use this variables as standard for all project so it's simple to swap
+# between them
 variables:
   MYSQL_DATABASE: gitlab_ci
   MYSQL_USER: gitlab
   MYSQL_PASSWORD: gitlabci
   MYSQL_ROOT_PASSWORD: gitlabci
 
-build:
+# Init the SSH system
+.init_ssh: &init_ssh |
+  mkdir -p ~/.ssh
+  chmod 700 ~/.ssh
+  echo $SSH_PRIVATE_KEY >> ~/.ssh/id_rsa
+  chmod 400 ~/.ssh/id_rsa
+  eval $(ssh-agent -s)
+  echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+  [[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+
+# Fix permissions due to issue https://gitlab.com/gitlab-org/gitlab-runner/issues/1736
+# Basically the file permissions are not strict enough but if they change it, it will break some existing features.
+.change_file_permissions: &change_file_permissions |
+  find . -type f -not -path "./vendor/*" -exec chmod 664 {} \;
+  find . -type d -not -path "./vendor/*" -exec chmod 775 {} \;
+
+# Reuse code to prepare assets between stages
+.prepare_assets: &prepare_assets |
+  php artisan horizon:assets
+  php artisan telescope:publish
+  php artisan export:messages-flat
+
+# Init the test suite
+.prepare_test_env: &prepare_test_env |
+  php artisan optimize:clear
+  php artisan storage:link
+  php artisan migrate:fresh --env=testing
+  mkdir -p ./reports
+
+# Start by creating the vendor folder for the stages
+install_vendors:
   stage: build
   environment:
     name: building
-  except:
-  - issue
-  - pushes
-  script:
-  - bash scripts/ci/run-composer.sh
-  - bash scripts/ci/run-npm.sh
-  retry: 1
-  cache:
-    key: ${CI_BUILD_REF_NAME}
-    paths:
-    - vendor/
-    - node_modules/
-    - public/
-    - .composer-cache/
-    untracked: true
   artifacts:
-    expire_in: 30 min
+    expire_in: 1 day
     paths:
-    - vendor/
-    - node_modules/
-    - public/
+      - vendor/
+      - node_modules/
+      - .env.testing
+      - .env
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-install
+    paths:
+      - vendor/
+      - node_modules/
+      - .composer-cache/
+  script:
+    - composer config -g cache-dir "$(pwd)/.composer-cache"
+    - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts -o
+    - cp .env.example .env.testing
+    - cp .env.example .env
+    - php artisan key:generate
+    - yarn
+  only:
+    - tags
+    - merge_requests
 
+# Compile js/css and other assets
+compile_assets:
+  stage: make
+  environment:
+    name: making
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - public/
+  dependencies:
+    - install_vendors
+  script:
+    - *prepare_assets
+    - yarn run production
+  only:
+    - tags
+    - merge_requests
+
+# Check Code Style
+codestyle:
+  stage: test
+  environment:
+    name: testing
+  artifacts:
+    paths:
+      - reports
+      - ./storage/logs
+    expire_in: 1 day
+    when: on_failure
+  dependencies: []
+  script:
+    - mkdir -p reports
+    - phpcs --standard=PSR2 --extensions=php --report=full --report-file=./reports/$CI_COMMIT_SHA.txt -v app
+  only:
+    - merge_requests
+
+# Testing time
 unit:
   stage: test
   environment:
     name: testing
-  except:
-  - issue
-  - pushes
-  services:
-  - redis:alpine
-  - mariadb:10.3
-  script:
-  - bash scripts/ci/run-unit.sh
-  retry: 1
   artifacts:
     paths:
-    - ./storage/logs
+      - reports
+      - ./storage/logs
     expire_in: 1 day
-    when: always
-  cache:
-    key: ${CI_BUILD_REF_NAME}
-    policy: pull
-
-feature:
-  stage: test
-  environment:
-    name: testing
-  except:
-  - issue
-  - pushes
-  services:
-  - redis:alpine
-  - mariadb:10.3
-  script:
-  - bash scripts/ci/run-feature.sh
-  retry: 1
-  artifacts:
-    paths:
-    - ./storage/logs
-    expire_in: 1 day
-    when: always
-  cache:
-    key: ${CI_BUILD_REF_NAME}
-    policy: pull
-
-browser:
-  stage: test
-  environment:
-    name: testing
-  except:
-    - issue
-    - pushes
-  image: chilio/laravel-dusk-ci:stable
+    when: on_failure
+  dependencies:
+    - install_vendors
   services:
     - redis:alpine
     - mariadb:10.3
   script:
-    - bash scripts/ci/run-browser.sh
-  retry: 1
-  cache:
-    key: ${CI_BUILD_REF_NAME}
-    policy: pull
+    - *prepare_test_env
+    - ./vendor/bin/phpunit --colors=never --filter Unit
+  only:
+    - merge_requests
+
+# Testing time
+feature:
+  stage: test
+  environment:
+    name: testing
   artifacts:
     paths:
+      - reports
       - ./storage/logs
-      - ./tests/Browser/screenshots
-      - ./tests/Browser/console
     expire_in: 1 day
-    when: always
+    when: on_failure
+  dependencies:
+    - install_vendors
+    - compile_assets
+  services:
+    - redis:alpine
+    - mariadb:10.3
+  script:
+    - *prepare_test_env
+    - ./vendor/bin/phpunit --colors=never --filter Feature
+  only:
+    - merge_requests
 
-deploy:
+# Production time
+production:
   stage: deploy
   environment:
     name: production
-  image: php:7.2-cli
-  only:
-  - tags
   script:
-  - bash scripts/ci/setup-deploy.sh
-  cache:
-    key: ${CI_BUILD_REF_NAME}
-    policy: pull
+    - *init_ssh
+    - *change_file_permissions
+    - php artisan deploy -s upload --log=./storage/logs/$CI_COMMIT_SHA.txt
+  only:
+    - tags
+  when: manual
